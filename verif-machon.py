@@ -79,7 +79,7 @@ def _(mo):
     sigma_adm_input = mo.ui.number(
         value=20.0, start=1.0, stop=200.0, step=0.01, label="Capacidad de soporte admisible (t/m²)"
     )
-    FSD_min_input = mo.ui.number(value=1.5, start=1.0, stop=3.0, step=0.05, label="FS mínimo exigido (desl.)")
+    FSD_min_input = mo.ui.number(value=1.3, start=1.0, stop=3.0, step=0.05, label="FS mínimo exigido (desl.)")
     FSV_min_input = mo.ui.number(value=1.5, start=1.0, stop=3.0, step=0.05, label="FS mínimo exigido (volc.)")
     mo.vstack([mo.hstack([gamma_c_input, phi_input, sigma_adm_input]), mo.hstack([FSV_min_input, FSD_min_input])])
     return (
@@ -100,25 +100,26 @@ def _(math, mo, phi_input):
 
 @app.cell
 def _(mo):
+
     pp_toggle_input = mo.ui.switch(
         value=False,
-        label="Incluir presión pasiva del terreno",
+        label="Incluir presion pasiva del terreno",
     )
     D_emb_input = mo.ui.number(
-        value=1.0, start=0.0, stop=5.0, step=0.05,
-        label="Profundidad de empotramiento contra terreno D_emb (m)",
+        value=0.5, start=0.0, stop=5.0, step=0.05,
+        label="Profundidad bajo terreno D_emb (m)",
     )
     gamma_suelo_input = mo.ui.number(
         value=18.0, start=12.0, stop=22.0, step=0.5,
-        label="Peso unitario del suelo γ_suelo (kN/m³)",
+        label="Peso unitario del suelo gamma_suelo (kN/m3)",
     )
     factor_mov_input = mo.ui.number(
         value=0.5, start=0.1, stop=1.0, step=0.05,
-        label="Factor de movilización de Pp (1.0 = Rankine completo)",
+        label="Factor de movilizacion de Pp (1.0 = Rankine completo)",
     )
     mo.vstack([
-        pp_toggle_input,
-        mo.hstack([D_emb_input, gamma_suelo_input, factor_mov_input]),
+        mo.hstack([D_emb_input, pp_toggle_input]),
+        mo.hstack([gamma_suelo_input, factor_mov_input]),
     ])
     return D_emb_input, factor_mov_input, gamma_suelo_input, pp_toggle_input
 
@@ -134,6 +135,7 @@ def _(mo):
 @app.cell
 def _(
     B_input,
+    D_emb_input,
     H_input,
     L_input,
     ancho_abertura_input,
@@ -144,61 +146,82 @@ def _(
     L = L_input.value
     H = H_input.value
     B = B_input.value
+    D_emb = min(D_emb_input.value, H)
     sep = sep_input.value
     n_pipes = int(n_pipes_input.value)
 
     r = ancho_abertura_input.value / 2.0
 
+    # Geometria base de abertura
     A_rect = 2.0 * r * r
     A_semi = math.pi * r ** 2 / 2.0
-    A_ab = A_semi + A_rect
-    h_ab = 2.0 * r
+    A_ab_base = A_semi + A_rect
+
+    # Altura total de la abertura considerando la extension de 2*r sobre el nivel de terreno
+    h_ext_sup = 2.0 * r
+    h_ab_total = min(H, D_emb + h_ext_sup)
 
     z_rect = r / 2.0
     z_semi = r + (4.0 * r) / (3.0 * math.pi)
-    z_ab = (A_rect * z_rect + A_semi * z_semi) / A_ab
+    z_ab = (A_rect * z_rect + A_semi * z_semi) / A_ab_base
 
-    # Posiciones horizontales de las aberturas según número de cañerías
     if n_pipes == 1:
         centros = [L / 2.0]
     else:
         centros = [L / 2.0 - sep / 2.0, L / 2.0 + sep / 2.0]
 
     warnings = []
-    if h_ab > H:
+    if h_ab_total > H:
         warnings.append(
-            f"⚠️ La altura de la abertura ({h_ab:.3f} m) supera la altura del machón H ({H:.3f} m)."
+            f"Warning: total opening height ({h_ab_total:.3f} m) exceeds H ({H:.3f} m)."
         )
     for xc in centros:
         if xc - r < 0 or xc + r > L:
             warnings.append(
-                "⚠️ Alguna abertura excede los límites del machón en la dirección L."
+                "Warning: opening exceeds machon boundaries in L direction."
             )
             break
     if n_pipes == 2 and (centros[0] + r > centros[1] - r):
-        warnings.append("⚠️ Las dos aberturas se traslapan entre sí (revisar separación).")
+        warnings.append("Warning: two openings overlap (check spacing).")
 
+    # 1. GEOMETRIA TOTAL MACHON (para Resistencia al Deslizamiento y Volcamiento)
     A_gross = L * H
-    z_gross = H / 2.0
-    A_ab_total = n_pipes * A_ab
+    A_ab_total = n_pipes * A_ab_base
     A_net = A_gross - A_ab_total
-
-    z_cg_net = (A_gross * z_gross - A_ab_total * z_ab) / A_net
-
+    z_gross = H / 2.0
+    z_cg_net = (A_gross * z_gross - A_ab_total * z_ab) / A_net if A_net > 0 else 0.0
     V_net = A_net * B
+
+    # 2. GEOMETRIA SOBRE TERRENO (para Determinacion de Cargas Sismicas)
+    H_sup = max(0.0, H - D_emb)
+    A_gross_sup = L * H_sup
+
+    # Area de abertura que queda sobre el nivel de terreno (extension de 2*r sobre cota D_emb)
+    h_sup_ab = min(H_sup, h_ext_sup)
+    A_ab_sup = (2.0 * r) * h_sup_ab
+
+    A_net_sup = max(0.0, A_gross_sup - n_pipes * A_ab_sup)
+    V_net_sup = A_net_sup * B
+
+    # Centroide de la masa aerea desde la base del machon (punto de aplicacion del sismo)
+    z_cg_sup = D_emb + (H_sup / 2.0) if H_sup > 0 else z_cg_net
     return (
-        A_ab,
+        A_ab_base,
         A_net,
         B,
+        D_emb,
         H,
         L,
         V_net,
+        V_net_sup,
         centros,
-        h_ab,
+        h_ab_total,
+        h_ext_sup,
         n_pipes,
         r,
         warnings,
         z_cg_net,
+        z_cg_sup,
     )
 
 
@@ -219,19 +242,31 @@ def _(B, L, centros, r):
 
 
 @app.cell
-def _(A_ab, A_net, V_net, h_ab, mo, r, warnings, z_cg_net):
-    warn_md = "\n\n".join(warnings) if warnings else "✅ Geometría de aberturas dentro de los límites del machón."
+def _(
+    A_ab_base,
+    A_net,
+    V_net,
+    V_net_sup,
+    h_ab_total,
+    h_ext_sup,
+    mo,
+    r,
+    warnings,
+    z_cg_net,
+):
+    warn_md = "\n\n".join(warnings) if warnings else "Aberturas dentro de los limites del machon."
 
     mo.md(
         f"""
-        **Radio de abertura (r):** {r:.3f} m &nbsp;|&nbsp; **Altura de abertura:** {h_ab:.3f} m
+        **Radio de abertura (r):** {r:.3f} m &nbsp;|&nbsp; **Altura de abertura total:** {h_ab_total:.3f} m &nbsp;|&nbsp; **Extension sobre terreno (2r):** {h_ext_sup:.3f} m
 
         | Magnitud | Valor |
         |---|---|
-        | Área de abertura | {A_ab:.4f} m² |
-        | Área neta sección | {A_net:.3f} m² |
-        | Volumen machón | {V_net:.3f} m³ |
+        | Area de abertura base | {A_ab_base:.4f} m2 |
+        | Area neta seccion | {A_net:.3f} m2 |
+        | Volumen machon | {V_net:.3f} m3 |
         | Altura del CG (desde la base) | {z_cg_net:.3f} m |
+        | Volumen sobre terreno | {V_net_sup:.3f} m3 |
 
         {warn_md}
         """
@@ -252,32 +287,36 @@ def _(
     Cs_input,
     Q_tub_input,
     V_net,
+    V_net_sup,
     gamma_c_input,
     mo,
     n_pipes,
     r_pipe_input,
     z_cg_net,
+    z_cg_sup,
 ):
     g = 9.81
     gamma_c = gamma_c_input.value  # kg/m3
     gamma_c_kN = gamma_c * g / 1000.0  # kN/m3
 
-    W = gamma_c_kN * V_net  # kN, peso propio neto
+    W = gamma_c_kN * V_net  # kN, peso neto TOTAL (deslizamiento y volcamiento)
+    W_sup = gamma_c_kN * V_net_sup  # kN, peso neto SOBRE TERRENO (sismo)
 
     Cs = Cs_input.value
-    F_sismo = Cs * W  # kN, aplicado en z_cg_net
+    F_sismo = Cs * W_sup  # kN, carga sismica basada en la masa sobre terreno
 
-    Q_tub = Q_tub_input.value  # kN, por cañería
+    Q_tub = Q_tub_input.value  # kN, por caneria
     F_tub = n_pipes * Q_tub  # kN, total
-    z_tub = r_pipe_input.value  # m, altura de aplicación
+    z_tub = r_pipe_input.value  # m, altura de aplicacion
 
     mo.md(
         f"""
-        | Carga | Valor | Punto de aplicación (altura desde la base) |
+        | Carga | Valor | Punto de aplicacion (altura desde la base) |
         |---|---|---|
-        | Peso propio neto W | {W:.2f} kN | z = {z_cg_net:.3f} m (centroide neto) |
-        | Carga transversal total F_tub ({n_pipes} cañerías) | {F_tub:.2f} kN | z = {z_tub:.3f} m |
-        | Carga sísmica F_sismo = Cs·W | {F_sismo:.2f} kN | z = {z_cg_net:.3f} m (centroide neto) |
+        | Peso propio neto total W | {W:.2f} kN | z = {z_cg_net:.3f} m (centroide total) |
+        | Peso sobre terreno W_sup | {W_sup:.2f} kN | z = {z_cg_sup:.3f} m (centroide masa ) |
+        | Carga transversal total F_tub ({n_pipes} canerias) | {F_tub:.2f} kN | z = {z_tub:.3f} m |
+        | Carga sismica F_sismo = Cs.W_sup | {F_sismo:.2f} kN | z = {z_cg_sup:.3f} m (centroide masa) |
         """
     )
     return F_sismo, F_tub, W, z_tub
@@ -295,7 +334,7 @@ def _(mo):
 def _(
     A_base_net,
     B,
-    D_emb_input,
+    D_emb,
     F_sismo,
     F_tub,
     I_base_net,
@@ -307,29 +346,28 @@ def _(
     mu,
     phi_input,
     pp_toggle_input,
-    z_cg_net,
+    z_cg_sup,
     z_tub,
 ):
-    # --- Momentos de volcamiento, evaluando el sismo en ambas direcciones ---
-    # Caso 1: sismo suma al empuje de las cañerías (gobernante en general)
-    M_ot_suma = F_tub * z_tub + F_sismo * z_cg_net
-    # Caso 2: sismo resta al empuje de las cañerías
-    M_ot_resta = abs(F_tub * z_tub - F_sismo * z_cg_net)
+    # Momento de volcamiento usando z_cg_sup para F_sismo
+    M_ot_suma = F_tub * z_tub + F_sismo * z_cg_sup
+    M_ot_resta = abs(F_tub * z_tub - F_sismo * z_cg_sup)
+    M_ot = max(M_ot_suma, M_ot_resta)
 
-    M_ot = max(M_ot_suma, M_ot_resta)  # combinación gobernante
-    M_r = W * (L / 2.0)  # momento resistente (peso, brazo L/2)
+    # Momento resistente considerando masa TOTAL W
+    M_r = W * (L / 2.0)
 
     FS_volc_suma = M_r / M_ot_suma if M_ot_suma > 0 else float("inf")
     FS_volc_resta = M_r / M_ot_resta if M_ot_resta > 0 else float("inf")
     FS_volc = min(FS_volc_suma, FS_volc_resta)
 
-    # --- Deslizamiento, sismo en ambas direcciones ---
+    # Resistencia al deslizamiento considerando masa TOTAL W
     Pp_total = 0.0
-    if pp_toggle_input.value and D_emb_input.value > 0:
+    if pp_toggle_input.value and D_emb > 0:
         Kp = math.tan(math.radians(45.0 + phi_input.value / 2.0)) ** 2
         Pp_total = (
             factor_mov_input.value * 0.5 * Kp
-            * gamma_suelo_input.value * D_emb_input.value ** 2 * B
+            * gamma_suelo_input.value * D_emb ** 2 * B
         )
 
     H_suma = F_tub + F_sismo
@@ -339,10 +377,8 @@ def _(
     FS_desl_resta = (mu * W + Pp_total) / H_resta if H_resta > 0 else float("inf")
     FS_desl = min(FS_desl_suma, FS_desl_resta)
 
-    # --- Presión de contacto sobre el suelo (usa la combinación gobernante M_ot) ---
+    # Tension sobre el suelo
     e = M_ot / W if W > 0 else 0.0
-
-    # q(x) = N/A_net + M·(x - L/2)/I_net, evaluado en los extremos x=0 y x=L
     q_max = W / A_base_net + M_ot * (L / 2.0) / I_base_net
     q_min = W / A_base_net - M_ot * (L / 2.0) / I_base_net
     contacto_total = q_min >= 0
@@ -432,13 +468,18 @@ def _(mo):
 
 
 @app.cell
-def _(F_sismo, F_tub, H, L, centros, np, plt, r, z_cg_net, z_tub):
+def _(D_emb, F_sismo, F_tub, H, L, centros, np, plt, r, z_cg_sup, z_tub):
     fig, ax = plt.subplots(figsize=(7, 4.5))
 
-    # Contorno del machón
+    # Contorno del machon
     ax.plot([0, L, L, 0, 0], [0, 0, H, H, 0], color="black", linewidth=1.5)
 
-    # Aberturas: rectángulo inferior + semicírculo superior
+    # Linea de nivel del terreno
+    if D_emb > 0:
+        ax.axhline(D_emb, color="sienna", linestyle=":", linewidth=1.0)
+        ax.annotate("Nivel del terreno", xy=(L * 0.02, D_emb), color="sienna", fontsize=7, va="bottom")
+
+    # Aberturas: rectangulo inferior + semicirculo superior
     for xx in centros:
         ax.plot(
             [xx - r, xx - r, xx + r, xx + r],
@@ -451,7 +492,7 @@ def _(F_sismo, F_tub, H, L, centros, np, plt, r, z_cg_net, z_tub):
         ys = r + r * np.sin(theta)
         ax.plot(xs, ys, color="firebrick", linewidth=1.2)
 
-    # Altura de aplicación de la carga transversal de las cañerías
+    # Altura de aplicacion de la carga transversal de las canerias
     ax.axhline(z_tub, color="steelblue", linestyle="--", linewidth=0.8)
     ax.annotate(
         f"F_tub = {F_tub:.1f} kN\n(z = {z_tub:.2f} m)",
@@ -461,11 +502,11 @@ def _(F_sismo, F_tub, H, L, centros, np, plt, r, z_cg_net, z_tub):
         va="bottom",
     )
 
-    # Centro de gravedad neto (altura de aplicación del sismo)
-    ax.plot(L / 2, z_cg_net, marker="x", color="darkgreen")
+    # Centro de gravedad de masa sobre terreno (altura de aplicacion del sismo)
+    ax.plot(L / 2, z_cg_sup, marker="x", color="darkgreen")
     ax.annotate(
-        f"CG neto, z = {z_cg_net:.2f} m\nF_sismo = {F_sismo:.1f} kN",
-        xy=(L / 2, z_cg_net),
+        f"CG sup, z = {z_cg_sup:.2f} m\nF_sismo = {F_sismo:.1f} kN",
+        xy=(L / 2, z_cg_sup),
         color="darkgreen",
         fontsize=8,
         ha="left",
@@ -477,7 +518,7 @@ def _(F_sismo, F_tub, H, L, centros, np, plt, r, z_cg_net, z_tub):
     ax.set_aspect("equal")
     ax.set_xlabel("L (m)")
     ax.set_ylabel("H (m)")
-    ax.set_title("Vista L-H del machón, con aberturas para las dos cañerías")
+    ax.set_title("Vista L-H del machon, con aberturas para las dos canerias")
     fig
     return
 
@@ -536,28 +577,41 @@ def _(math):
     ):
         A_rect = 2.0 * r * r
         A_semi = math.pi * r ** 2 / 2.0
-        A_ab = A_semi + A_rect
+        A_ab_base = A_semi + A_rect
         A_gross = L * H
-        A_net = A_gross - n_pipes * A_ab
+        A_net = A_gross - n_pipes * A_ab_base
         if A_net <= 0:
             return float("nan")
         V_net = A_net * B
+
+        # Extension de abertura sobre terreno (2*r sobre cota D_emb)
+        D_emb_eff = min(D_emb, H)
+        H_sup = max(0.0, H - D_emb_eff)
+        A_gross_sup = L * H_sup
+
+        h_sup_ab = min(H_sup, 2.0 * r)
+        A_ab_sup = (2.0 * r) * h_sup_ab
+        A_net_sup = max(0.0, A_gross_sup - n_pipes * A_ab_sup)
+        V_net_sup = A_net_sup * B
+
         gamma_c_kN = gamma_c * 9.81 / 1000.0
-        W = gamma_c_kN * V_net
-        F_sismo = Cs * W
+        W_total = gamma_c_kN * V_net
+        W_sup = gamma_c_kN * V_net_sup
+
+        F_sismo = Cs * W_sup
         F_tub = n_pipes * Q_tub
         H_suma = F_tub + F_sismo
         H_resta = abs(F_tub - F_sismo)
         H_total = max(H_suma, H_resta)
 
         Pp_total = 0.0
-        if pp_enabled and D_emb > 0:
+        if pp_enabled and D_emb_eff > 0:
             Kp = math.tan(math.radians(45.0 + phi_deg / 2.0)) ** 2
-            Pp_total = factor_mov * 0.5 * Kp * gamma_suelo * D_emb ** 2 * B
+            Pp_total = factor_mov * 0.5 * Kp * gamma_suelo * D_emb_eff ** 2 * B
 
         if H_total <= 0:
             return float("inf")
-        return (mu * W + Pp_total) / H_total
+        return (mu * W_total + Pp_total) / H_total
 
 
     return (calc_fsd,)
